@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.cache/
+.vite/
+.tmp/
+.playwright-cli/
+output/playwright/
+python/.venv/
+*.log
+
+__pycache__/
+*.pyc

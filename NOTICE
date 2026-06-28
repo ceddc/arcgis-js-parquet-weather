@@ -1,0 +1,35 @@
+ArcGIS JavaScript Parquet Weather Sample - Notices
+
+Project code
+------------
+The original HTML, CSS, JavaScript, and Python code in this repository is
+released under the MIT License. See LICENSE.
+
+MeteoSwiss data
+---------------
+The generated Parquet sample files are derived from MeteoSwiss Open Data E4
+local forecasts. MeteoSwiss Open Data is published under CC BY 4.0 according
+to the MeteoSwiss terms of use.
+
+Required meteorological data acknowledgement:
+Source: MeteoSwiss
+
+Do not imply that MeteoSwiss endorses this project or a particular use of the
+data.
+
+Derived surface data
+--------------------
+The optional polygon and hexagon Parquet files are visualization layers created
+by this project from MeteoSwiss forecast points. They are not official
+MeteoSwiss gridded products.
+
+Those derived surfaces are clipped with a Swiss boundary file from the Federal
+Spatial Data Infrastructure / swisstopo. When publishing those surfaces, use:
+Source: MeteoSwiss; © Data: swisstopo
+
+Relevant links
+--------------
+MeteoSwiss terms: https://opendatadocs.meteoswiss.ch/general/terms-of-use
+MeteoSwiss Open Data: https://www.meteoswiss.admin.ch/services-and-publications/service/open-data.html
+CC BY 4.0: https://creativecommons.org/licenses/by/4.0/
+FSDI terms: https://www.geo.admin.ch/en/general-terms-of-use-fsdi

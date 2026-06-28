@@ -1,0 +1,11 @@
+[project]
+name = "arcgis-parquet-weather-data"
+version = "0.1.0"
+description = "MeteoSwiss Open Data to ArcGIS-compatible Parquet tooling."
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    # PyArrow writes Parquet metadata. Shapely is only for optional derived surface polygons.
+    "pyarrow>=16.0",
+    "shapely>=2.0",
+]

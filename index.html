@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="fr-CH">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="./assets/switzerland-weather-logo.png" type="image/png" />
+    <link rel="stylesheet" href="https://js.arcgis.com/5.1/@arcgis/core/assets/esri/themes/light/main.css" />
+    <link rel="stylesheet" href="./css/style.css" />
+    <script type="module" src="./js/loading-page.js"></script>
+    <script type="module" src="https://js.arcgis.com/5.1/"></script>
+    <script type="module" src="./js/app.js"></script>
+    <title>ArcGIS ParquetLayer: MeteoSwiss Forecasts</title>
+    <!-- Matomo -->
+    <script>
+      var _paq = window._paq = window._paq || [];
+      /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+      _paq.push(['trackPageView']);
+      _paq.push(['enableLinkTracking']);
+      (function() {
+        var u="//stats.ceddc.ch/";
+        _paq.push(['setTrackerUrl', u+'matomo.php']);
+        _paq.push(['setSiteId', '2']);
+        var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
+        g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
+      })();
+    </script>
+    <!-- End Matomo Code -->
+  </head>
+  <body class="calcite-mode-light">
+    <calcite-shell>
+      <calcite-shell-panel
+        id="forecast-panel"
+        slot="panel-start"
+        display-mode="dock"
+        width-scale="m"
+        class="forecast-panel"
+        aria-label="MeteoSwiss forecast controls"
+      >
+        <calcite-panel
+          heading="MeteoSwiss Forecasts"
+          description="ArcGIS ParquetLayer sample"
+          heading-level="2"
+          scale="s"
+        >
+          <calcite-action
+            id="mobile-controls-close"
+            class="mobile-controls-close"
+            slot="header-actions-end"
+            icon="x"
+            text="Close MeteoSwiss forecast controls"
+          ></calcite-action>
+          <div class="panel-stack">
+            <calcite-block heading="Controls" expanded scale="s">
+              <div class="control-list">
+                <div class="control-row">
+                  <span id="geometry-label" class="control-row__label">Geometry</span>
+                  <calcite-select id="geometry-select" aria-labelledby="geometry-label" scale="s">
+                    <calcite-option value="hex" selected>Hexagon</calcite-option>
+                    <calcite-option value="square">Polygon</calcite-option>
+                    <calcite-option value="points">Raw points</calcite-option>
+                  </calcite-select>
+                </div>
+
+                <div class="control-row">
+                  <span id="field-label" class="control-row__label">Field</span>
+                  <calcite-select id="field-select" aria-labelledby="field-label" scale="s">
+                    <calcite-option value="tre200h0" selected>Temperature 2 m</calcite-option>
+                    <calcite-option value="rp0003i0">Precipitation probability (3 h)</calcite-option>
+                    <calcite-option value="rre150h0">Hourly precipitation</calcite-option>
+                    <calcite-option value="fu3010h0">Wind speed</calcite-option>
+                    <calcite-option value="nprolohs">Low cloud cover</calcite-option>
+                    <calcite-option value="npromths">Medium cloud cover</calcite-option>
+                    <calcite-option value="nprohihs">High cloud cover</calcite-option>
+                  </calcite-select>
+                </div>
+
+                <div class="control-row">
+                  <span id="details-label" class="control-row__label">Details</span>
+                  <calcite-segmented-control
+                    id="info-mode-control"
+                    appearance="outline"
+                    aria-labelledby="details-label"
+                    scale="s"
+                    value="hover"
+                    width="full"
+                  >
+                    <calcite-segmented-control-item value="hover" checked>Hover</calcite-segmented-control-item>
+                    <calcite-segmented-control-item value="popup">Popup</calcite-segmented-control-item>
+                  </calcite-segmented-control>
+                </div>
+              </div>
+            </calcite-block>
+
+            <calcite-block heading="Legend" expanded class="legend-block" scale="s">
+              <arcgis-legend
+                id="map-legend"
+                reference-element="map"
+                legend-style="classic"
+                respect-layer-definition-expression
+              ></arcgis-legend>
+            </calcite-block>
+
+            <calcite-button id="code-button" appearance="outline" icon-start="code" scale="s" width="full">
+              Code
+            </calcite-button>
+
+            <div id="parquet-stats" class="parquet-stats" aria-live="polite" hidden>
+              <span id="feature-counts" class="parquet-stats__counts"></span>
+            </div>
+
+            <div class="resource-links" aria-label="Related resources">
+              <a
+                class="resource-link resource-link--source"
+                href="https://www.meteoswiss.admin.ch/services-and-publications/service/open-data.html"
+                target="_blank"
+                rel="noopener"
+              >Source: MeteoSwiss</a>
+              <a
+                class="resource-link resource-link--github"
+                href="https://github.com/ceddc/arcgis-js-parquet-weather"
+                target="_blank"
+                rel="noopener"
+              >
+                <svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.22.48-2.69-.95-2.69-.95-.36-.92-.89-1.17-.89-1.17-.73-.5.06-.49.06-.49.8.06 1.22.83 1.22.83.72 1.22 1.88.87 2.33.67.07-.52.28-.87.51-1.07-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.6 7.6 0 0 1 8 2.52c.68 0 1.36.09 2 .27 1.52-1.03 2.19-.82 2.19-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"
+                  />
+                </svg>
+                <span>GitHub project</span>
+              </a>
+              <div class="resource-links__secondary">
+                <a
+                  href="https://developers.arcgis.com/javascript/latest/sample-code/layers-parquetlayer/"
+                  target="_blank"
+                  rel="noopener"
+                >ArcGIS sample</a>
+                <a
+                  href="https://developers.arcgis.com/javascript/latest/references/core/layers/ParquetLayer/"
+                  target="_blank"
+                  rel="noopener"
+                >ParquetLayer API</a>
+              </div>
+            </div>
+
+            <calcite-notice id="status" scale="s" kind="brand" hidden>
+              <div slot="message">Loading forecast layer</div>
+            </calcite-notice>
+          </div>
+        </calcite-panel>
+      </calcite-shell-panel>
+
+      <main class="map-stage">
+        <button
+          id="mobile-controls-button"
+          class="mobile-controls-button"
+          type="button"
+          aria-controls="forecast-panel"
+          aria-expanded="false"
+          aria-label="MeteoSwiss forecast controls"
+          title="MeteoSwiss forecast controls"
+        >
+          <calcite-icon icon="sliders-horizontal" scale="s" aria-hidden="true"></calcite-icon>
+        </button>
+        <div id="mobile-panel-scrim" class="mobile-panel-scrim" hidden></div>
+        <arcgis-map id="map" center="8.23,46.82" zoom="7">
+          <arcgis-zoom slot="top-left"></arcgis-zoom>
+          <arcgis-time-slider id="time-slider" layout="compact" time-visible time-zone="Europe/Zurich"></arcgis-time-slider>
+        </arcgis-map>
+
+        <calcite-select id="time-select" hidden></calcite-select>
+        <section id="feature-window" class="map-hover-card" aria-live="polite" hidden></section>
+      </main>
+    </calcite-shell>
+
+    <calcite-dialog id="code-dialog" heading="ParquetLayer sample code" width-scale="l">
+      <div class="code-dialog-body">
+        <p>Loads one MeteoSwiss Parquet file URL with ParquetLayer and applies one forecast-time filter.</p>
+        <pre class="code-panel"><code id="parquet-code"></code></pre>
+      </div>
+    </calcite-dialog>
+  </body>
+</html>

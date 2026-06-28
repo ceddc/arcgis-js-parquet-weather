@@ -1,0 +1,59 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: weather-data-${{ github.run_id }}
+          restore-keys: |
+            weather-data-
+      - uses: actions/setup-python@v5
+        if: github.event_name != 'push'
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        if: github.event_name != 'push'
+      - run: uv run --project python python/scripts/refresh_sample_data.py --geometry all --max-age-hours 6
+        if: github.event_name != 'push'
+      - uses: actions/cache/save@v4
+        if: github.event_name != 'push'
+        with:
+          path: data
+          key: weather-data-${{ github.run_id }}
+      - run: |
+          mkdir -p _site
+          cp index.html LICENSE NOTICE github-pages-parquet-head-worker.js _site/
+          cp -R assets css js data _site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

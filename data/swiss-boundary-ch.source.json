@@ -1,0 +1,11 @@
+{
+  "local_file": "data/swiss-boundary-ch.geojson",
+  "source": "Federal Spatial Data Infrastructure FSDI / swisstopo",
+  "source_layer": "ch.swisstopo.swissboundaries3d-land-flaeche.fill",
+  "source_feature_id": "CH",
+  "source_url": "https://api3.geo.admin.ch/rest/services/api/MapServer/ch.swisstopo.swissboundaries3d-land-flaeche.fill/CH?geometryFormat=geojson&sr=4326",
+  "attribution": "© Data: swisstopo",
+  "terms_url": "https://www.geo.admin.ch/en/general-terms-of-use-fsdi",
+  "purpose": "Optional square/hex surface clipping only; not used by the default point Parquet path.",
+  "downloaded_at": "2026-06-27T15:34:05.9608602Z"
+}
