@@ -611,6 +611,28 @@ function hasSelectedForecastValue(graphic, state) {
   return hasForecastValue(graphic?.attributes?.[state.selectedField]);
 }
 
+function featureEpochSeconds(graphic) {
+  const epochMs = numberAttribute(graphic?.attributes ?? {}, "valid_time_epoch_ms");
+
+  if (Number.isFinite(epochMs)) {
+    return Math.round((epochMs > 10_000_000_000 ? epochMs : epochMs * 1000) / 1000);
+  }
+
+  const validTime = graphic?.attributes?.valid_time;
+
+  if (typeof validTime === "string") {
+    const parsed = new Date(validTime);
+    return Number.isFinite(parsed.getTime()) ? Math.round(parsed.getTime() / 1000) : null;
+  }
+
+  return null;
+}
+
+function featureMatchesEpoch(graphic, epochSeconds) {
+  const featureEpoch = featureEpochSeconds(graphic);
+  return !Number.isFinite(featureEpoch) || featureEpoch === epochSeconds;
+}
+
 function splitPlaceNames(value) {
   if (typeof value !== "string") {
     return [];
@@ -872,6 +894,28 @@ function hideInfoWindow(state, options = {}) {
 }
 
 // 5. Popup mode helpers.
+function invalidatePopupRefresh(state) {
+  if (!state) {
+    return 0;
+  }
+
+  const serial = Number.isFinite(state.popupRefreshSerial) ? state.popupRefreshSerial : 0;
+  state.popupRefreshSerial = serial + 1;
+  return state.popupRefreshSerial;
+}
+
+function currentPopupRefreshSerial(state) {
+  return Number.isFinite(state?.popupRefreshSerial) ? state.popupRefreshSerial : 0;
+}
+
+function activeMapPopup(state) {
+  return state?.mapElement?.popupElement ?? state?.mapElement?.popup ?? state?.mapElement?.view?.popup ?? null;
+}
+
+function popupVisible(popup) {
+  return typeof popup?.open === "boolean" ? popup.open : Boolean(popup?.visible);
+}
+
 function clearPopupFeatures(popup) {
   if (!popup) {
     return;
@@ -886,13 +930,7 @@ function clearPopupFeatures(popup) {
   }
 }
 
-function closeMapPopup(state) {
-  const view = state?.mapElement?.view;
-  const popup = view?.popup;
-
-  view?.closePopup?.();
-  popup?.close?.();
-
+function resetPopupContent(popup) {
   if (!popup) {
     return;
   }
@@ -900,7 +938,28 @@ function closeMapPopup(state) {
   clearPopupFeatures(popup);
   popup.selectedFeatureIndex = 0;
   popup.title = "";
-  popup.visible = false;
+
+  if ("heading" in popup) {
+    popup.heading = "";
+  }
+}
+
+function closeMapPopup(state) {
+  const mapElement = state?.mapElement;
+  const popup = activeMapPopup(state);
+
+  invalidatePopupRefresh(state);
+  mapElement?.closePopup?.();
+  mapElement?.view?.closePopup?.();
+  popup?.close?.();
+
+  if (popup) {
+    resetPopupContent(popup);
+    if (typeof popup.open === "boolean") {
+      popup.open = false;
+    }
+    popup.visible = false;
+  }
 }
 
 function clearFeatureDetails(state) {
@@ -911,6 +970,7 @@ function clearFeatureDetails(state) {
 function applyInfoMode(state) {
   const popupMode = state.infoMode === "popup";
 
+  invalidatePopupRefresh(state);
   if (state.layer) {
     state.layer.popupEnabled = popupMode;
   }
@@ -925,6 +985,69 @@ function applyInfoMode(state) {
   }
 
   clearFeatureDetails(state);
+}
+
+function eventTargetsPopupClose(event) {
+  const path = event.composedPath?.() ?? [];
+  const insidePopup = path.some((target) =>
+    target instanceof Element && target.classList.contains("esri-popup"));
+  const closeAction = path.find((target) => {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+
+    const label = target.getAttribute("aria-label") ?? target.getAttribute("title") ?? "";
+    const icon = target.getAttribute("icon") ?? target.icon ?? "";
+    return target.tagName === "CALCITE-ACTION" && (icon === "x" || /^(close|fermer)$/i.test(label));
+  });
+
+  return Boolean(insidePopup && closeAction);
+}
+
+function setupNativePopupLifecycle(state) {
+  const popup = activeMapPopup(state);
+  const mapElement = state?.mapElement;
+  const handles = [];
+
+  if (!mapElement) {
+    return { remove() {} };
+  }
+
+  const closePopupFromAction = (event) => {
+    if (state.infoMode !== "popup" || !eventTargetsPopupClose(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    closeMapPopup(state);
+  };
+
+  mapElement.addEventListener("click", closePopupFromAction, true);
+  handles.push({ remove: () => mapElement.removeEventListener("click", closePopupFromAction, true) });
+
+  if (popup && reactiveUtils) {
+    handles.push(reactiveUtils.watch(
+      () => popupVisible(popup),
+      (isVisible) => {
+        if (isVisible) {
+          return;
+        }
+
+        invalidatePopupRefresh(state);
+
+        if (state.infoMode === "popup") {
+          resetPopupContent(popup);
+        }
+      },
+    ));
+  }
+
+  return {
+    remove() {
+      handles.forEach((handle) => handle.remove?.());
+    },
+  };
 }
 
 function updateLayerStyle(state, fields, popupTemplateFor, createRenderer) {
@@ -1111,10 +1234,52 @@ function createTimeFilterController(state, timeSelect, timeSlider, validTimeWher
   // Slider dragging can emit updates faster than the layer should be filtered.
   // Keep only the latest requested epoch and apply it once per animation frame.
   let pendingEpoch = null;
+  let pendingOptions = {};
   let frame = 0;
+  let followUpRefreshEpoch = null;
+  let followUpRefreshTimeout = 0;
+
+  const refreshVisibleDetails = (epoch) => {
+    if (state.infoMode === "popup") {
+      void refreshOpenPopup(state, epoch);
+    } else if (state.hoverDetails) {
+      state.hoverDetails.refresh({ immediate: true, quietSticky: true });
+    } else {
+      hideInfoWindow(state);
+    }
+  };
+
+  const scheduleFollowUpDetailsRefresh = (epoch) => {
+    followUpRefreshEpoch = epoch;
+
+    if (followUpRefreshTimeout) {
+      return;
+    }
+
+    followUpRefreshTimeout = window.setTimeout(() => {
+      followUpRefreshTimeout = 0;
+
+      if (Number.isFinite(followUpRefreshEpoch) && state.selectedEpoch === followUpRefreshEpoch) {
+        refreshVisibleDetails(followUpRefreshEpoch);
+      }
+    }, 260);
+  };
 
   return function scheduleTimeFilter(epochSeconds, options = {}) {
-    pendingEpoch = epochSeconds;
+    const epochNumber = Number(epochSeconds);
+
+    if (!Number.isFinite(epochNumber)) {
+      return;
+    }
+
+    if (!frame && pendingEpoch === null && state.selectedEpoch === epochNumber) {
+      return;
+    }
+
+    pendingOptions = {
+      syncSlider: pendingOptions.syncSlider === false || options.syncSlider === false ? false : options.syncSlider,
+    };
+    pendingEpoch = epochNumber;
 
     if (frame) {
       return;
@@ -1129,11 +1294,13 @@ function createTimeFilterController(state, timeSelect, timeSlider, validTimeWher
 
       const epoch = pendingEpoch;
       pendingEpoch = null;
+      const frameOptions = pendingOptions;
+      pendingOptions = {};
       state.selectedEpoch = epoch;
       state.layer.definitionExpression = validTimeWhere(epoch);
       timeSelect.value = String(epoch);
 
-      if (options.syncSlider !== false) {
+      if (frameOptions.syncSlider !== false) {
         timeSlider.timeExtent = {
           start: new Date(epoch * 1000),
           end: new Date(epoch * 1000),
@@ -1141,14 +1308,8 @@ function createTimeFilterController(state, timeSelect, timeSlider, validTimeWher
       }
 
       state.parquetStats?.refresh?.();
-
-      if (state.infoMode === "popup") {
-        void refreshOpenPopup(state, epoch);
-      } else if (state.hoverDetails) {
-        state.hoverDetails.refresh({ immediate: true, quietSticky: true });
-      } else {
-        hideInfoWindow(state);
-      }
+      refreshVisibleDetails(epoch);
+      scheduleFollowUpDetailsRefresh(epoch);
     });
   };
 }
@@ -1334,6 +1495,29 @@ function popupAnchorMapPoint(popup) {
   return popup?.location ?? featureCenterMapPoint(selectedPopupFeature(popup));
 }
 
+function mapPointSignature(mapPoint) {
+  if (!mapPoint) {
+    return "";
+  }
+
+  const x = Number(mapPoint.longitude ?? mapPoint.x);
+  const y = Number(mapPoint.latitude ?? mapPoint.y);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return "";
+  }
+
+  return `${x.toFixed(6)},${y.toFixed(6)}`;
+}
+
+function popupTargetSignature(popup, state) {
+  const selectedFeature = selectedPopupFeature(popup);
+  const identityWhere = identityWhereForFeature(selectedFeature, state.geometry.geometryType) ?? "";
+  const mapPoint = popupAnchorMapPoint(popup);
+
+  return `${identityWhere}|${mapPointSignature(mapPoint)}`;
+}
+
 async function popupGraphicForRefresh(popup, layer, state) {
   const selectedFeature = selectedPopupFeature(popup);
   const identityWhere = identityWhereForFeature(selectedFeature, state.geometry.geometryType);
@@ -1351,21 +1535,30 @@ async function refreshOpenPopup(state, expectedEpoch = state.selectedEpoch) {
   // Popup mode uses the native ArcGIS popup. When the time filter changes, the
   // selected feature object is stale, so we re-query the same feature identity
   // under the new layer definitionExpression and replace the popup feature.
-  if (state.infoMode !== "popup" || !state.layer || !state.mapElement?.view?.popup) {
+  const popup = activeMapPopup(state);
+
+  if (state.infoMode !== "popup" || !state.layer || !popup) {
     return;
   }
 
-  const view = state.mapElement.view;
-  const popup = view.popup;
-
-  if (!popup.visible) {
+  if (!popupVisible(popup)) {
     return;
   }
 
-  const mapPoint = popupAnchorMapPoint(popup);
-  const graphic = await popupGraphicForRefresh(popup, state.layer, state);
+  const refreshSerial = invalidatePopupRefresh(state);
+  const layer = state.layer;
+  const targetSignature = popupTargetSignature(popup, state);
+  const graphic = await popupGraphicForRefresh(popup, layer, state);
 
-  if (!graphic || state.infoMode !== "popup" || state.selectedEpoch !== expectedEpoch) {
+  if (
+    !graphic ||
+    state.infoMode !== "popup" ||
+    state.selectedEpoch !== expectedEpoch ||
+    state.layer !== layer ||
+    currentPopupRefreshSerial(state) !== refreshSerial ||
+    !popupVisible(popup) ||
+    popupTargetSignature(popup, state) !== targetSignature
+  ) {
     return;
   }
 
@@ -1379,8 +1572,12 @@ async function refreshOpenPopup(state, expectedEpoch = state.selectedEpoch) {
   }
 
   popup.selectedFeatureIndex = 0;
-  popup.location = popup.location ?? mapPoint ?? featureCenterMapPoint(graphic);
+  popup.location = featureCenterMapPoint(graphic) ?? popupAnchorMapPoint(popup);
   popup.title = state.layer.title;
+
+  if ("heading" in popup) {
+    popup.heading = state.layer.title;
+  }
 }
 
 // 7. Hover and sticky-card interaction.
@@ -1411,7 +1608,12 @@ function setupHoverDetails(mapElement, state, fields) {
   let hoverTimeoutHandle = 0;
   let stickyArmTimeoutHandle = 0;
   let stickyRefreshTimeoutHandle = 0;
+  let hoverLookupInFlight = false;
+  let hoverLookupPending = null;
+  let stickyRefreshInFlight = false;
+  let stickyRefreshPendingOptions = null;
   let stickyRepositionFrameHandle = 0;
+  let busyRefreshTimeoutHandle = 0;
   let hoverRequestId = 0;
   let stickyRequestId = 0;
   let hoverPoint = null;
@@ -1472,7 +1674,10 @@ function setupHoverDetails(mapElement, state, fields) {
   function stickyScreenPoint() {
     if (stickyMapPoint) {
       const screenPoint = view.toScreen(stickyMapPoint);
-      return isFiniteScreenPoint(screenPoint) ? { x: screenPoint.x, y: screenPoint.y, mapPoint: stickyMapPoint } : null;
+
+      if (isFiniteScreenPoint(screenPoint)) {
+        return { x: screenPoint.x, y: screenPoint.y, mapPoint: stickyMapPoint };
+      }
     }
 
     return stickyPoint;
@@ -1498,6 +1703,10 @@ function setupHoverDetails(mapElement, state, fields) {
 
   function screenDistance(first, second) {
     return Math.hypot(first.x - second.x, first.y - second.y);
+  }
+
+  function sameHoverPoint(point) {
+    return Boolean(hoverPoint && screenDistance(hoverPoint, point) <= 1);
   }
 
   function featureScreenPoint(graphic) {
@@ -1611,6 +1820,31 @@ function setupHoverDetails(mapElement, state, fields) {
       window.clearTimeout(stickyRefreshTimeoutHandle);
       stickyRefreshTimeoutHandle = 0;
     }
+  }
+
+  function mergeStickyRefreshOptions(currentOptions, nextOptions = {}) {
+    return {
+      immediate: true,
+      quietSticky: (currentOptions?.quietSticky ?? true) && Boolean(nextOptions.quietSticky),
+    };
+  }
+
+  function clearBusyRefreshTimeout() {
+    if (busyRefreshTimeoutHandle) {
+      window.clearTimeout(busyRefreshTimeoutHandle);
+      busyRefreshTimeoutHandle = 0;
+    }
+  }
+
+  function scheduleBusyRefreshRetry() {
+    if (busyRefreshTimeoutHandle) {
+      return;
+    }
+
+    busyRefreshTimeoutHandle = window.setTimeout(() => {
+      busyRefreshTimeoutHandle = 0;
+      refresh({ immediate: true, quietSticky: true });
+    }, 360);
   }
 
   function clearStickyRepositionFrame() {
@@ -1811,6 +2045,7 @@ function setupHoverDetails(mapElement, state, fields) {
   function hideHoverCard(options = {}) {
     clearHoverTimeout();
     hoverRequestId += 1;
+    hoverLookupPending = null;
     if (options.clearHighlight !== false) {
       clearFeatureHighlight(false);
     }
@@ -1828,6 +2063,8 @@ function setupHoverDetails(mapElement, state, fields) {
 
     clearStickyArmTimeout();
     clearStickyRefreshTimeout();
+    stickyRefreshPendingOptions = null;
+    clearBusyRefreshTimeout();
     clearStickyRepositionFrame();
     clearFeatureHighlight(true);
     stickyRequestId += 1;
@@ -1985,8 +2222,9 @@ function setupHoverDetails(mapElement, state, fields) {
 
   // Every hover lookup is asynchronous. expectedHoverRequestId prevents older
   // lookups from replacing newer pointer or time-slider results.
-  async function updateHover(point, expectedHoverRequestId, armSticky = true, preserveStickyArm = false) {
+  async function updateHover(point, expectedHoverRequestId, armSticky = true, preserveStickyArm = false, options = {}) {
     const layer = activeLayer();
+    const expectedEpoch = options.expectedEpoch ?? state.selectedEpoch;
 
     if (!layer) {
       hideHoverCard();
@@ -2002,15 +2240,25 @@ function setupHoverDetails(mapElement, state, fields) {
 
     try {
       setCardLoading(hoverCardElement, !stickyCardVisible() && !armingStickyTimerActive());
-      const graphic = await featureAtPoint(point, layer, { preferQuery: busy });
+      const graphic = await featureAtPoint(point, layer, { preferQuery: options.preferQuery ?? busy });
 
-      if (expectedHoverRequestId !== hoverRequestId || layer !== activeLayer()) {
+      if (layer !== activeLayer() || (expectedHoverRequestId !== hoverRequestId && !sameHoverPoint(point))) {
+        return;
+      }
+
+      if (graphic && state.selectedEpoch !== expectedEpoch && !featureMatchesEpoch(graphic, state.selectedEpoch)) {
+        requestHover(point, 0, armSticky, preserveStickyArm);
         return;
       }
 
       setCardLoading(hoverCardElement, false);
 
       if (!graphic || !hasSelectedForecastValue(graphic, state)) {
+        if (busy) {
+          scheduleBusyRefreshRetry();
+          return;
+        }
+
         clearStickyArmTimeout();
         hideHoverCard();
         return;
@@ -2051,10 +2299,36 @@ function setupHoverDetails(mapElement, state, fields) {
         clearStickyArmTimeout();
       }
     } catch {
-      setCardLoading(hoverCardElement, false);
-      clearStickyArmTimeout();
-      hideHoverCard();
+      if (expectedHoverRequestId === hoverRequestId || sameHoverPoint(point)) {
+        setCardLoading(hoverCardElement, false);
+        clearStickyArmTimeout();
+        hideHoverCard();
+      }
     }
+  }
+
+  function runHoverLookup(payload) {
+    if (hoverLookupInFlight) {
+      hoverLookupPending = payload;
+      return;
+    }
+
+    hoverLookupInFlight = true;
+    void updateHover(
+      payload.point,
+      payload.requestId,
+      payload.armSticky,
+      payload.preserveStickyArm,
+      payload.options,
+    ).finally(() => {
+      hoverLookupInFlight = false;
+      const pendingPayload = hoverLookupPending;
+      hoverLookupPending = null;
+
+      if (pendingPayload && activeLayer()) {
+        runHoverLookup(pendingPayload);
+      }
+    });
   }
 
   function requestHover(point, delayMs = queryDelayMs, armSticky = true, preserveStickyArm = false) {
@@ -2070,14 +2344,26 @@ function setupHoverDetails(mapElement, state, fields) {
 
     hoverTimeoutHandle = window.setTimeout(() => {
       hoverTimeoutHandle = 0;
-      void updateHover(point, nextHoverRequestId, armSticky, preserveStickyArm);
+      runHoverLookup({
+        armSticky,
+        options: {
+          expectedEpoch: state.selectedEpoch,
+          preferQuery: layerViewBusy(),
+        },
+        point,
+        preserveStickyArm,
+        requestId: nextHoverRequestId,
+      });
     }, delayMs);
   }
 
   // Sticky cards keep an identity query so their value can refresh when the
   // time filter changes without requiring the user to reopen the card.
-  async function updateSticky(point, expectedStickyRequestId, showLoading = true) {
+  async function updateSticky(point, showLoading = true) {
     const layer = activeLayer();
+    const expectedEpoch = state.selectedEpoch;
+    const expectedStickyFeatureWhere = stickyFeatureWhere;
+    const expectedStickyFeatureKey = stickyFeatureKey;
 
     if (!layer || !stickyCardElement) {
       hideStickyCard();
@@ -2088,7 +2374,25 @@ function setupHoverDetails(mapElement, state, fields) {
       setCardLoading(stickyCardElement, showLoading);
       const graphic = await stickyGraphicForRefresh(point, layer);
 
-      if (expectedStickyRequestId !== stickyRequestId || layer !== activeLayer()) {
+      if (
+        layer !== activeLayer() ||
+        state.selectedEpoch !== expectedEpoch ||
+        !stickyCardVisible() ||
+        stickyFeatureWhere !== expectedStickyFeatureWhere ||
+        stickyFeatureKey !== expectedStickyFeatureKey
+      ) {
+        if (
+          layer === activeLayer() &&
+          stickyCardVisible() &&
+          stickyFeatureWhere === expectedStickyFeatureWhere &&
+          stickyFeatureKey === expectedStickyFeatureKey &&
+          state.selectedEpoch !== expectedEpoch
+        ) {
+          stickyRefreshPendingOptions = mergeStickyRefreshOptions(stickyRefreshPendingOptions, {
+            quietSticky: true,
+          });
+        }
+
         return;
       }
 
@@ -2121,6 +2425,14 @@ function setupHoverDetails(mapElement, state, fields) {
       return;
     }
 
+    if (stickyRefreshInFlight) {
+      stickyRefreshPendingOptions = mergeStickyRefreshOptions(stickyRefreshPendingOptions, options);
+      if (!options.quietSticky && stickyCardElement) {
+        setCardLoading(stickyCardElement, true);
+      }
+      return;
+    }
+
     const point = stickyScreenPoint();
 
     if (!isFiniteScreenPoint(point)) {
@@ -2143,7 +2455,16 @@ function setupHoverDetails(mapElement, state, fields) {
 
       if (refreshPoint && nextStickyRequestId === stickyRequestId) {
         stickyPoint = { ...refreshPoint };
-        void updateSticky(refreshPoint, nextStickyRequestId, showLoading);
+        stickyRefreshInFlight = true;
+        void updateSticky(refreshPoint, showLoading).finally(() => {
+          stickyRefreshInFlight = false;
+          const pendingOptions = stickyRefreshPendingOptions;
+          stickyRefreshPendingOptions = null;
+
+          if (pendingOptions && stickyCardVisible()) {
+            requestStickyRefresh(pendingOptions);
+          }
+        });
       }
     }, options.immediate ? 0 : 80);
   }
@@ -2154,15 +2475,17 @@ function setupHoverDetails(mapElement, state, fields) {
 
     if (layerViewBusy()) {
       markHoverWaiting();
+
       if (stickyCardVisible() && !options.quietSticky) {
         setCardLoading(stickyCardElement, true);
       }
-      return;
+
+      scheduleBusyRefreshRetry();
     }
 
     requestStickyRefresh(options);
 
-    if (hoverPoint && !stickyCardVisible()) {
+    if (hoverPoint) {
       requestHover(hoverPoint, options.immediate ? 0 : 80, false, true);
     }
   }
@@ -2218,7 +2541,10 @@ function setupHoverDetails(mapElement, state, fields) {
 
     try {
       setCardLoading(stickyCardElement, true);
-      const graphic = clickedHoverGraphic ?? await featureAtPoint(point, layer);
+      const reusableHoverGraphic = clickedHoverGraphic && featureMatchesEpoch(clickedHoverGraphic, state.selectedEpoch)
+        ? clickedHoverGraphic
+        : null;
+      const graphic = reusableHoverGraphic ?? await featureAtPoint(point, layer, { preferQuery: layerViewBusy() });
 
       if (expectedStickyRequestId !== stickyRequestId || layer !== activeLayer()) {
         return;
@@ -2452,6 +2778,7 @@ export function setupSampleControls(options) {
   setupMobileControls();
   state.parquetStats = setupParquetStatsPanel(state);
   state.hoverDetails = setupHoverDetails(mapElement, state, fields);
+  state.nativePopupLifecycle = setupNativePopupLifecycle(state);
 
   const controller = {
     syncLayer() {
@@ -2507,15 +2834,21 @@ export function setupSampleControls(options) {
     applyInfoMode(state);
   });
 
+  const scheduleFilterFromTimeMs = (timeMs) => {
+    if (typeof timeMs !== "number" || !state.layer || !state.sidecar) {
+      return;
+    }
+
+    scheduleTimeFilter(nearestEpoch(state.sidecar.timeInfo.epochSeconds, timeMs), { syncSlider: false });
+  };
+
+  timeSlider.addEventListener("arcgisPropertyChange", () => {
+    scheduleFilterFromTimeMs(timeSlider.timeExtent?.start?.getTime());
+  });
+
   reactiveUtils.watch(
     () => mapElement.view.timeExtent?.start?.getTime() ?? null,
-    (timeMs) => {
-      if (typeof timeMs !== "number" || !state.layer || !state.sidecar) {
-        return;
-      }
-
-      scheduleTimeFilter(nearestEpoch(state.sidecar.timeInfo.epochSeconds, timeMs), { syncSlider: false });
-    },
+    scheduleFilterFromTimeMs,
   );
 
   return controller;
