@@ -3,6 +3,7 @@ dist/
 .cache/
 .vite/
 .tmp/
+.learnings/
 .playwright-cli/
 output/playwright/
 python/.venv/

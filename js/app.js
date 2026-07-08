@@ -84,6 +84,9 @@ const state = {
   sidecar: null,
 };
 
+const geometryLayerCache = new globalThis.Map();
+const geometryLayerRequests = new globalThis.Map();
+
 function setStatus(message, kind = "brand", open = true) {
   status.kind = kind;
   status.hidden = !open;
@@ -132,6 +135,64 @@ async function readParquetByteSize(parquetUrl) {
   const byteSize = Number(contentLength);
 
   return Number.isFinite(byteSize) && byteSize > 0 ? byteSize : null;
+}
+
+async function readGeometrySource(geometry) {
+  const { parquetUrl, sidecarUrl } = urlsForGeometry(geometry);
+  const [sidecar, parquetBytes] = await Promise.all([
+    fetch(sidecarUrl, { cache: "no-cache" }).then((response) => response.json()),
+    readParquetByteSize(parquetUrl),
+  ]);
+
+  return {
+    layerParquetUrl: versionedParquetUrl(parquetUrl, sidecar),
+    parquetBytes,
+    sidecar,
+  };
+}
+
+async function drainResponseBody(response) {
+  const reader = response.body?.getReader?.();
+
+  if (!reader) {
+    await response.arrayBuffer();
+    return;
+  }
+
+  while (true) {
+    const { done } = await reader.read();
+
+    if (done) {
+      return;
+    }
+  }
+}
+
+async function warmParquetFile(entry) {
+  if (entry.fileWarmed) {
+    return;
+  }
+
+  if (entry.fileWarmRequest) {
+    return entry.fileWarmRequest;
+  }
+
+  entry.fileWarmRequest = (async () => {
+    const response = await fetch(entry.layerParquetUrl, { cache: "force-cache" });
+
+    if (!response.ok) {
+      throw new Error(`Failed to preload ${entry.geometry.label}`);
+    }
+
+    await drainResponseBody(response);
+    entry.fileWarmed = true;
+  })();
+
+  try {
+    await entry.fileWarmRequest;
+  } finally {
+    entry.fileWarmRequest = null;
+  }
 }
 
 function geometryEncodingFor(geometry) {
@@ -245,6 +306,17 @@ function popupTemplateFor(fieldName, geometry = state.geometry) {
   };
 }
 
+function configureForecastLayer(layer, geometry) {
+  const field = fields[state.selectedField];
+
+  layer.title = field.label;
+  layer.opacity = geometry.opacity;
+  layer.popupEnabled = state.infoMode === "popup";
+  layer.popupTemplate = popupTemplateFor(state.selectedField, geometry);
+  layer.renderer = rendererForField(state.selectedField, geometry.geometryType, field.label);
+  layer.definitionExpression = validTimeWhere(state.selectedEpoch);
+}
+
 // Core ArcGIS sample: load one Parquet URL, declare the WKB geometry column, and
 // apply the current renderer/popup configuration.
 function createForecastLayer(geometry, parquetUrl) {
@@ -262,8 +334,93 @@ function createForecastLayer(geometry, parquetUrl) {
     spatialReference: { wkid: 4326 },
   });
 
-  layer.definitionExpression = validTimeWhere(state.selectedEpoch);
+  configureForecastLayer(layer, geometry);
   return layer;
+}
+
+async function ensureGeometryLayer(geometryKey) {
+  const geometry = geometries[geometryKey];
+
+  if (!geometry) {
+    throw new Error(`Unknown geometry: ${geometryKey}`);
+  }
+
+  if (geometryLayerCache.has(geometryKey)) {
+    return geometryLayerCache.get(geometryKey);
+  }
+
+  if (geometryLayerRequests.has(geometryKey)) {
+    return geometryLayerRequests.get(geometryKey);
+  }
+
+  const request = (async () => {
+    const { layerParquetUrl, parquetBytes, sidecar } = await readGeometrySource(geometry);
+    const epochs = sidecar.timeInfo.epochSeconds;
+
+    if (!state.selectedEpoch || !epochs.includes(state.selectedEpoch)) {
+      state.selectedEpoch = nearestEpochToDate(epochs);
+    }
+
+    const layer = createForecastLayer(geometry, layerParquetUrl);
+    const entry = { geometry, layer, layerParquetUrl, parquetBytes, sidecar };
+
+    await layer.load();
+    geometryLayerCache.set(geometryKey, entry);
+
+    return entry;
+  })();
+
+  geometryLayerRequests.set(geometryKey, request);
+
+  try {
+    return await request;
+  } catch (error) {
+    geometryLayerCache.delete(geometryKey);
+    throw error;
+  } finally {
+    geometryLayerRequests.delete(geometryKey);
+  }
+}
+
+function mapHasLayer(layer) {
+  return mapElement.map.layers.toArray().includes(layer);
+}
+
+async function activateGeometry(geometryKey) {
+  const entry = await ensureGeometryLayer(geometryKey);
+  const { geometry, layer: nextLayer, parquetBytes, sidecar } = entry;
+  const epochs = sidecar.timeInfo.epochSeconds;
+  const previousLayer = state.layer;
+
+  if (!state.selectedEpoch || !epochs.includes(state.selectedEpoch)) {
+    state.selectedEpoch = nearestEpochToDate(epochs);
+  }
+
+  configureForecastLayer(nextLayer, geometry);
+
+  if (!mapHasLayer(nextLayer)) {
+    mapElement.map.add(nextLayer);
+  }
+
+  state.geometryKey = geometryKey;
+  state.geometry = geometry;
+  state.infoPinned = false;
+  state.layer = nextLayer;
+  state.parquetBytes = parquetBytes;
+  state.sidecar = sidecar;
+
+  if (previousLayer && previousLayer !== nextLayer && mapHasLayer(previousLayer)) {
+    mapElement.map.remove(previousLayer);
+  }
+
+  const queriedExtent = nextLayer.fullExtent ? null : await nextLayer.queryExtent().catch(() => null);
+  const targetExtent = nextLayer.fullExtent ?? queriedExtent?.extent;
+
+  if (targetExtent) {
+    await mapElement.view.goTo(targetExtent.expand(1.08), { animate: false }).catch(() => undefined);
+  }
+
+  setStatus("", "success", false);
 }
 
 // Swap the active Parquet file while preserving the selected forecast time when possible.
@@ -276,44 +433,7 @@ async function loadGeometry(geometryKey) {
 
   setStatus(`Loading ${geometry.label}`);
   setLoadingPageStatus(`Loading ${geometry.label}`, "72%");
-
-  const { parquetUrl, sidecarUrl } = urlsForGeometry(geometry);
-  const [sidecar, parquetBytes] = await Promise.all([
-    fetch(sidecarUrl, { cache: "no-cache" }).then((response) => response.json()),
-    readParquetByteSize(parquetUrl),
-  ]);
-  const layerParquetUrl = versionedParquetUrl(parquetUrl, sidecar);
-  const epochs = sidecar.timeInfo.epochSeconds;
-
-  if (!state.selectedEpoch || !epochs.includes(state.selectedEpoch)) {
-    state.selectedEpoch = nearestEpochToDate(epochs);
-  }
-
-  const nextLayer = createForecastLayer(geometry, layerParquetUrl);
-  const previousLayer = state.layer;
-
-  await nextLayer.load();
-  mapElement.map.add(nextLayer);
-
-  state.geometryKey = geometryKey;
-  state.geometry = geometry;
-  state.infoPinned = false;
-  state.layer = nextLayer;
-  state.parquetBytes = parquetBytes;
-  state.sidecar = sidecar;
-
-  if (previousLayer) {
-    mapElement.map.remove(previousLayer);
-  }
-
-  const queriedExtent = nextLayer.fullExtent ? null : await nextLayer.queryExtent().catch(() => null);
-  const targetExtent = nextLayer.fullExtent ?? queriedExtent?.extent;
-
-  if (targetExtent) {
-    await mapElement.view.goTo(targetExtent.expand(1.08), { animate: false }).catch(() => undefined);
-  }
-
-  setStatus("", "success", false);
+  await activateGeometry(geometryKey);
 }
 
 async function waitForMapView() {
@@ -330,6 +450,42 @@ async function waitForMapView() {
   }
 
   throw new Error("ArcGIS MapView is not ready.");
+}
+
+async function waitForViewIdle() {
+  const view = mapElement.view;
+
+  if (!view) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    if (!view.updating) {
+      return true;
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+
+  return false;
+}
+
+async function preloadInactiveGeometries() {
+  const viewIsIdle = await waitForViewIdle();
+
+  if (!viewIsIdle) {
+    return;
+  }
+
+  for (const geometryKey of Object.keys(geometries)) {
+    if (geometryKey !== state.geometryKey) {
+      const entry = await ensureGeometryLayer(geometryKey).catch(() => null);
+
+      if (entry) {
+        await warmParquetFile(entry).catch(() => undefined);
+      }
+    }
+  }
 }
 
 async function start() {
@@ -356,6 +512,7 @@ async function start() {
   await loadGeometry(state.geometryKey);
   controls.syncLayer();
   completeLoadingPage();
+  void preloadInactiveGeometries();
 }
 
 start().catch((error) => {

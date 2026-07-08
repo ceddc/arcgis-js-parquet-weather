@@ -1642,6 +1642,7 @@ function setupHoverDetails(mapElement, state, fields) {
   let layerViewRequestId = 0;
   let layerViewUpdating = false;
   let layerViewDataUpdating = false;
+  let lifecycleGeneration = 0;
 
   if (hoverCardElement && stageElement) {
     stickyCardElement = document.querySelector("#feature-window-sticky");
@@ -1656,7 +1657,11 @@ function setupHoverDetails(mapElement, state, fields) {
   }
 
   function activeLayer() {
-    return state.infoMode === "hover" ? state.layer : null;
+    return state.infoMode === "hover" && !state.geometryLoading ? state.layer : null;
+  }
+
+  function currentLifecycle(generation) {
+    return generation === lifecycleGeneration;
   }
 
   function pointFromEvent(event) {
@@ -1874,13 +1879,18 @@ function setupHoverDetails(mapElement, state, fields) {
     }
 
     const requestId = layerViewRequestId;
+    const generation = lifecycleGeneration;
 
     view.whenLayerView(layer).then((layerView) => {
-      if (requestId !== layerViewRequestId || layer !== activeLayer()) {
+      if (!currentLifecycle(generation) || requestId !== layerViewRequestId || layer !== activeLayer()) {
         return;
       }
 
       const updateLayerViewState = ([updating, dataUpdating] = [layerView.updating, layerView.dataUpdating]) => {
+        if (!currentLifecycle(generation)) {
+          return;
+        }
+
         layerViewUpdating = Boolean(updating);
         layerViewDataUpdating = Boolean(dataUpdating);
 
@@ -2085,6 +2095,36 @@ function setupHoverDetails(mapElement, state, fields) {
     }
   }
 
+  function resetForLayerChange() {
+    lifecycleGeneration += 1;
+    clearHoverTimeout();
+    clearStickyArmTimeout();
+    clearStickyRefreshTimeout();
+    clearBusyRefreshTimeout();
+    clearStickyRepositionFrame();
+    clearLayerViewWatch();
+    clearViewClickSuppression();
+    clearDismissedSticky();
+    clearFeatureHighlight(false);
+    clearFeatureHighlight(true);
+
+    hoverLookupInFlight = false;
+    hoverLookupPending = null;
+    stickyRefreshInFlight = false;
+    stickyRefreshPendingOptions = null;
+    hoverRequestId += 1;
+    stickyRequestId += 1;
+    hoverPoint = null;
+    hoverGraphic = null;
+    stickyPoint = null;
+    stickyMapPoint = null;
+    stickyFeatureWhere = null;
+    stickyFeatureKey = null;
+    state.infoPinned = false;
+    resetInfoCard(hoverCardElement);
+    resetInfoCard(stickyCardElement);
+  }
+
   async function hitTestLayer(point, layer = activeLayer()) {
     if (!layer) {
       return null;
@@ -2225,6 +2265,11 @@ function setupHoverDetails(mapElement, state, fields) {
   async function updateHover(point, expectedHoverRequestId, armSticky = true, preserveStickyArm = false, options = {}) {
     const layer = activeLayer();
     const expectedEpoch = options.expectedEpoch ?? state.selectedEpoch;
+    const generation = options.generation ?? lifecycleGeneration;
+
+    if (!currentLifecycle(generation)) {
+      return;
+    }
 
     if (!layer) {
       hideHoverCard();
@@ -2242,7 +2287,11 @@ function setupHoverDetails(mapElement, state, fields) {
       setCardLoading(hoverCardElement, !stickyCardVisible() && !armingStickyTimerActive());
       const graphic = await featureAtPoint(point, layer, { preferQuery: options.preferQuery ?? busy });
 
-      if (layer !== activeLayer() || (expectedHoverRequestId !== hoverRequestId && !sameHoverPoint(point))) {
+      if (
+        !currentLifecycle(generation) ||
+        layer !== activeLayer() ||
+        (expectedHoverRequestId !== hoverRequestId && !sameHoverPoint(point))
+      ) {
         return;
       }
 
@@ -2299,7 +2348,7 @@ function setupHoverDetails(mapElement, state, fields) {
         clearStickyArmTimeout();
       }
     } catch {
-      if (expectedHoverRequestId === hoverRequestId || sameHoverPoint(point)) {
+      if (currentLifecycle(generation) && (expectedHoverRequestId === hoverRequestId || sameHoverPoint(point))) {
         setCardLoading(hoverCardElement, false);
         clearStickyArmTimeout();
         hideHoverCard();
@@ -2308,6 +2357,10 @@ function setupHoverDetails(mapElement, state, fields) {
   }
 
   function runHoverLookup(payload) {
+    if (!currentLifecycle(payload.generation)) {
+      return;
+    }
+
     if (hoverLookupInFlight) {
       hoverLookupPending = payload;
       return;
@@ -2321,11 +2374,15 @@ function setupHoverDetails(mapElement, state, fields) {
       payload.preserveStickyArm,
       payload.options,
     ).finally(() => {
+      if (!currentLifecycle(payload.generation)) {
+        return;
+      }
+
       hoverLookupInFlight = false;
       const pendingPayload = hoverLookupPending;
       hoverLookupPending = null;
 
-      if (pendingPayload && activeLayer()) {
+      if (pendingPayload && currentLifecycle(pendingPayload.generation) && activeLayer()) {
         runHoverLookup(pendingPayload);
       }
     });
@@ -2336,6 +2393,7 @@ function setupHoverDetails(mapElement, state, fields) {
     hoverPoint = { ...point };
     const nextHoverRequestId = hoverRequestId + 1;
     hoverRequestId = nextHoverRequestId;
+    const generation = lifecycleGeneration;
 
     if (preserveStickyArm && stickyArmTimeoutHandle) {
       pendingStickyPoint = { ...point };
@@ -2344,10 +2402,17 @@ function setupHoverDetails(mapElement, state, fields) {
 
     hoverTimeoutHandle = window.setTimeout(() => {
       hoverTimeoutHandle = 0;
+
+      if (!currentLifecycle(generation)) {
+        return;
+      }
+
       runHoverLookup({
         armSticky,
+        generation,
         options: {
           expectedEpoch: state.selectedEpoch,
+          generation,
           preferQuery: layerViewBusy(),
         },
         point,
@@ -2364,6 +2429,11 @@ function setupHoverDetails(mapElement, state, fields) {
     const expectedEpoch = state.selectedEpoch;
     const expectedStickyFeatureWhere = stickyFeatureWhere;
     const expectedStickyFeatureKey = stickyFeatureKey;
+    const generation = lifecycleGeneration;
+
+    if (!currentLifecycle(generation)) {
+      return;
+    }
 
     if (!layer || !stickyCardElement) {
       hideStickyCard();
@@ -2376,6 +2446,7 @@ function setupHoverDetails(mapElement, state, fields) {
 
       if (
         layer !== activeLayer() ||
+        !currentLifecycle(generation) ||
         state.selectedEpoch !== expectedEpoch ||
         !stickyCardVisible() ||
         stickyFeatureWhere !== expectedStickyFeatureWhere ||
@@ -2414,7 +2485,9 @@ function setupHoverDetails(mapElement, state, fields) {
       renderInfoCard(stickyCardElement, graphic, state, fields, anchorPoint, true, anchorPoint, stickyDelayMs);
       void setFeatureHighlight(graphic, layer, true);
     } catch {
-      setCardLoading(stickyCardElement, false);
+      if (currentLifecycle(generation)) {
+        setCardLoading(stickyCardElement, false);
+      }
     }
   }
 
@@ -2447,16 +2520,21 @@ function setupHoverDetails(mapElement, state, fields) {
     const nextStickyRequestId = stickyRequestId + 1;
     stickyRequestId = nextStickyRequestId;
     const showLoading = !options.quietSticky;
+    const generation = lifecycleGeneration;
 
     setCardLoading(stickyCardElement, false);
     stickyRefreshTimeoutHandle = window.setTimeout(() => {
       const refreshPoint = stickyScreenPoint();
       stickyRefreshTimeoutHandle = 0;
 
-      if (refreshPoint && nextStickyRequestId === stickyRequestId) {
+      if (refreshPoint && currentLifecycle(generation) && nextStickyRequestId === stickyRequestId) {
         stickyPoint = { ...refreshPoint };
         stickyRefreshInFlight = true;
         void updateSticky(refreshPoint, showLoading).finally(() => {
+          if (!currentLifecycle(generation)) {
+            return;
+          }
+
           stickyRefreshInFlight = false;
           const pendingOptions = stickyRefreshPendingOptions;
           stickyRefreshPendingOptions = null;
@@ -2471,6 +2549,10 @@ function setupHoverDetails(mapElement, state, fields) {
 
   // Re-run the visible card lookups after time, view, or layer-view updates.
   function refresh(options = {}) {
+    if (!activeLayer()) {
+      return;
+    }
+
     scheduleStickyReposition();
 
     if (layerViewBusy()) {
@@ -2523,6 +2605,7 @@ function setupHoverDetails(mapElement, state, fields) {
     const point = pointFromEvent(event);
     const layer = activeLayer();
     const clickedHoverGraphic = hoverGraphic && hoverPoint && screenDistance(hoverPoint, point) <= 24 ? hoverGraphic : null;
+    const generation = lifecycleGeneration;
 
     clearStickyArmTimeout();
     clearStickyRefreshTimeout();
@@ -2546,7 +2629,7 @@ function setupHoverDetails(mapElement, state, fields) {
         : null;
       const graphic = reusableHoverGraphic ?? await featureAtPoint(point, layer, { preferQuery: layerViewBusy() });
 
-      if (expectedStickyRequestId !== stickyRequestId || layer !== activeLayer()) {
+      if (!currentLifecycle(generation) || expectedStickyRequestId !== stickyRequestId || layer !== activeLayer()) {
         return;
       }
 
@@ -2566,7 +2649,9 @@ function setupHoverDetails(mapElement, state, fields) {
       renderInfoCard(stickyCardElement, graphic, state, fields, anchorPoint, true, anchorPoint, stickyDelayMs);
       void setFeatureHighlight(graphic, layer, true);
     } catch {
-      setCardLoading(stickyCardElement, false);
+      if (currentLifecycle(generation)) {
+        setCardLoading(stickyCardElement, false);
+      }
     }
   }
 
@@ -2632,12 +2717,12 @@ function setupHoverDetails(mapElement, state, fields) {
       stickyCardElement?.removeEventListener("pointerdown", stopClosePointer, true);
       hoverCardElement?.removeEventListener("click", closeSticky, true);
       stickyCardElement?.removeEventListener("click", closeSticky, true);
-      clearLayerViewWatch();
-      hideAll();
+      resetForLayerChange();
       stickyCardElement?.remove();
     },
     hide: hideAll,
     refresh,
+    resetForLayerChange,
     syncLayer: syncLayerView,
   };
 }
@@ -2799,16 +2884,22 @@ export function setupSampleControls(options) {
 
   geometrySelect.addEventListener("calciteSelectChange", async () => {
     geometrySelect.disabled = true;
+    state.geometryLoading = true;
+    state.hoverDetails?.resetForLayerChange?.();
     clearFeatureDetails(state);
 
     try {
       await loadGeometry(geometrySelect.value || state.geometryKey);
+      state.geometryLoading = false;
       controller.syncLayer();
     } catch (error) {
+      state.geometryLoading = false;
       console.error(error);
       geometrySelect.value = state.geometryKey;
       setStatus(error instanceof Error ? error.message : "Geometry failed to load", "danger");
+      controller.syncLayer();
     } finally {
+      state.geometryLoading = false;
       geometrySelect.disabled = false;
     }
   });
