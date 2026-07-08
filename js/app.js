@@ -11,7 +11,7 @@ import { completeLoadingPage, failLoadingPage, setLoadingPageStatus } from "./lo
 
 // This file is the core sample path:
 // 1. define the local Parquet files,
-// 2. create one ArcGIS ParquetLayer,
+// 2. create the active ArcGIS ParquetLayer,
 // 3. let forecast-extras.js wire the optional UI around it.
 const parquetHeadReady = prepareGitHubPagesParquetHead();
 
@@ -86,6 +86,10 @@ const state = {
 
 const geometryLayerCache = new globalThis.Map();
 const geometryLayerRequests = new globalThis.Map();
+const geometryLayerViewRequests = new globalThis.Map();
+const preloadStartDelayMs = 3000;
+const preloadIdleWindowMs = 1500;
+let lastUserInteractionAt = 0;
 
 function setStatus(message, kind = "brand", open = true) {
   status.kind = kind;
@@ -129,6 +133,33 @@ function versionedParquetUrl(parquetUrl, sidecar) {
   return url.toString();
 }
 
+function expandedExtent(extent, factor = 1.08) {
+  const xmin = extent?.xmin ?? extent?.west;
+  const ymin = extent?.ymin ?? extent?.south;
+  const xmax = extent?.xmax ?? extent?.east;
+  const ymax = extent?.ymax ?? extent?.north;
+
+  if (![xmin, ymin, xmax, ymax].every(Number.isFinite)) {
+    return null;
+  }
+
+  const widthPadding = ((xmax - xmin) * (factor - 1)) / 2;
+  const heightPadding = ((ymax - ymin) * (factor - 1)) / 2;
+
+  return {
+    spatialReference: { wkid: 4326 },
+    type: "extent",
+    xmax: xmax + widthPadding,
+    xmin: xmin - widthPadding,
+    ymax: ymax + heightPadding,
+    ymin: ymin - heightPadding,
+  };
+}
+
+function sidecarExtent(sidecar) {
+  return expandedExtent(sidecar?.surface_resolution?.extent ?? sidecar?.point_extent ?? sidecar?.extent);
+}
+
 async function readParquetByteSize(parquetUrl) {
   const response = await fetch(parquetUrl, { method: "HEAD", cache: "no-cache" }).catch(() => null);
   const contentLength = response?.headers.get("Content-Length");
@@ -149,50 +180,6 @@ async function readGeometrySource(geometry) {
     parquetBytes,
     sidecar,
   };
-}
-
-async function drainResponseBody(response) {
-  const reader = response.body?.getReader?.();
-
-  if (!reader) {
-    await response.arrayBuffer();
-    return;
-  }
-
-  while (true) {
-    const { done } = await reader.read();
-
-    if (done) {
-      return;
-    }
-  }
-}
-
-async function warmParquetFile(entry) {
-  if (entry.fileWarmed) {
-    return;
-  }
-
-  if (entry.fileWarmRequest) {
-    return entry.fileWarmRequest;
-  }
-
-  entry.fileWarmRequest = (async () => {
-    const response = await fetch(entry.layerParquetUrl, { cache: "force-cache" });
-
-    if (!response.ok) {
-      throw new Error(`Failed to preload ${entry.geometry.label}`);
-    }
-
-    await drainResponseBody(response);
-    entry.fileWarmed = true;
-  })();
-
-  try {
-    await entry.fileWarmRequest;
-  } finally {
-    entry.fileWarmRequest = null;
-  }
 }
 
 function geometryEncodingFor(geometry) {
@@ -386,17 +373,126 @@ function mapHasLayer(layer) {
   return mapElement.map.layers.toArray().includes(layer);
 }
 
+function delay(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function noteUserInteraction() {
+  lastUserInteractionAt = performance.now();
+}
+
+function setLayerActive(entry, active) {
+  const { geometry, layer } = entry;
+
+  layer.visible = active;
+  layer.opacity = active ? geometry.opacity : 0;
+  layer.popupEnabled = active && state.infoMode === "popup";
+  layer.legendEnabled = active;
+  layer.listMode = active ? "show" : "hide";
+}
+
+function setLayerDormant(entry) {
+  const { layer } = entry;
+
+  layer.visible = true;
+  layer.opacity = 0;
+  layer.popupEnabled = false;
+  layer.legendEnabled = false;
+  layer.listMode = "hide";
+}
+
+function setLayerPreparing(layer) {
+  layer.visible = true;
+  layer.opacity = 0;
+  layer.popupEnabled = false;
+  layer.legendEnabled = false;
+  layer.listMode = "hide";
+}
+
+function deactivateInactiveGeometryLayers(activeLayer) {
+  for (const cachedEntry of geometryLayerCache.values()) {
+    if (cachedEntry.layer !== activeLayer && mapHasLayer(cachedEntry.layer)) {
+      setLayerDormant(cachedEntry);
+    }
+  }
+}
+
+function syncCachedGeometryLayers(options = {}) {
+  const updateStyle = options.style !== false;
+  const expression = state.selectedEpoch ? validTimeWhere(state.selectedEpoch) : null;
+
+  for (const cachedEntry of geometryLayerCache.values()) {
+    const { geometry, layer } = cachedEntry;
+
+    if (updateStyle) {
+      configureForecastLayer(layer, geometry);
+    } else if (expression) {
+      layer.definitionExpression = expression;
+    }
+
+    if (layer === state.layer) {
+      setLayerActive(cachedEntry, true);
+    } else if (mapHasLayer(layer)) {
+      setLayerDormant(cachedEntry);
+    }
+  }
+
+  syncActiveLegendLayer(state.layer);
+}
+
+function syncActiveLegendLayer(activeLayer) {
+  const legendElement = document.querySelector("#map-legend");
+
+  if (legendElement) {
+    legendElement.layerInfos = activeLayer ? [{ layer: activeLayer }] : [];
+  }
+}
+
+async function crossfadeToLayer(previousLayer, nextLayer, nextOpacity) {
+  if (!previousLayer || previousLayer === nextLayer || !mapHasLayer(previousLayer)) {
+    nextLayer.opacity = nextOpacity;
+    return;
+  }
+
+  const previousOpacity = Number.isFinite(previousLayer.opacity) ? previousLayer.opacity : 1;
+  const durationMs = 180;
+
+  await new Promise((resolve) => {
+    const startedAt = performance.now();
+
+    const step = (timestamp) => {
+      const progress = Math.min(1, (timestamp - startedAt) / durationMs);
+      nextLayer.opacity = nextOpacity * progress;
+      previousLayer.opacity = previousOpacity * (1 - progress);
+
+      if (progress < 1) {
+        window.requestAnimationFrame(step);
+        return;
+      }
+
+      resolve();
+    };
+
+    window.requestAnimationFrame(step);
+  });
+}
+
 async function activateGeometry(geometryKey) {
   const entry = await ensureGeometryLayer(geometryKey);
   const { geometry, layer: nextLayer, parquetBytes, sidecar } = entry;
   const epochs = sidecar.timeInfo.epochSeconds;
   const previousLayer = state.layer;
+  const smoothSwitch = Boolean(previousLayer && previousLayer !== nextLayer);
 
   if (!state.selectedEpoch || !epochs.includes(state.selectedEpoch)) {
     state.selectedEpoch = nearestEpochToDate(epochs);
   }
 
   configureForecastLayer(nextLayer, geometry);
+
+  if (smoothSwitch) {
+    setLayerPreparing(nextLayer);
+  }
 
   if (!mapHasLayer(nextLayer)) {
     mapElement.map.add(nextLayer);
@@ -409,17 +505,29 @@ async function activateGeometry(geometryKey) {
   state.parquetBytes = parquetBytes;
   state.sidecar = sidecar;
 
-  if (previousLayer && previousLayer !== nextLayer && mapHasLayer(previousLayer)) {
-    mapElement.map.remove(previousLayer);
+  if (!smoothSwitch) {
+    setLayerActive(entry, true);
+    syncActiveLegendLayer(nextLayer);
   }
 
-  const queriedExtent = nextLayer.fullExtent ? null : await nextLayer.queryExtent().catch(() => null);
-  const targetExtent = nextLayer.fullExtent ?? queriedExtent?.extent;
+  const targetExtent = sidecarExtent(sidecar) ?? expandedExtent(nextLayer.fullExtent);
 
-  if (targetExtent) {
-    await mapElement.view.goTo(targetExtent.expand(1.08), { animate: false }).catch(() => undefined);
+  if (!smoothSwitch && targetExtent) {
+    await mapElement.view.goTo(targetExtent, { animate: false }).catch(() => undefined);
   }
 
+  await waitForGeometryLayerView(geometryKey, nextLayer);
+  await waitForViewIdle();
+
+  if (smoothSwitch) {
+    nextLayer.popupEnabled = state.infoMode === "popup";
+    nextLayer.legendEnabled = true;
+    nextLayer.listMode = "show";
+    syncActiveLegendLayer(nextLayer);
+    await crossfadeToLayer(previousLayer, nextLayer, geometry.opacity);
+  }
+
+  deactivateInactiveGeometryLayers(nextLayer);
   setStatus("", "success", false);
 }
 
@@ -464,13 +572,71 @@ async function waitForViewIdle() {
       return true;
     }
 
-    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    await delay(100);
   }
 
   return false;
 }
 
+async function waitForLayerViewIdle(layer) {
+  const layerView = await mapElement.view.whenLayerView(layer);
+
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    if (!layerView.updating && !layerView.dataUpdating) {
+      return true;
+    }
+
+    await delay(100);
+  }
+
+  return false;
+}
+
+async function waitForGeometryLayerView(geometryKey, layer) {
+  if (geometryLayerViewRequests.has(geometryKey)) {
+    return geometryLayerViewRequests.get(geometryKey);
+  }
+
+  const request = waitForLayerViewIdle(layer).finally(() => {
+    geometryLayerViewRequests.delete(geometryKey);
+  });
+
+  geometryLayerViewRequests.set(geometryKey, request);
+  return request;
+}
+
+async function preloadResidentGeometry(geometryKey) {
+  const entry = await ensureGeometryLayer(geometryKey);
+
+  if (entry.layer === state.layer) {
+    return entry;
+  }
+
+  configureForecastLayer(entry.layer, entry.geometry);
+  setLayerDormant(entry);
+
+  if (!mapHasLayer(entry.layer)) {
+    mapElement.map.add(entry.layer);
+  }
+
+  await waitForGeometryLayerView(geometryKey, entry.layer);
+
+  if (entry.layer !== state.layer && mapHasLayer(entry.layer)) {
+    setLayerDormant(entry);
+  }
+
+  return entry;
+}
+
 async function preloadInactiveGeometries() {
+  if (state.layer) {
+    const activeLayerIsReady = await waitForLayerViewIdle(state.layer).catch(() => false);
+
+    if (!activeLayerIsReady) {
+      return;
+    }
+  }
+
   const viewIsIdle = await waitForViewIdle();
 
   if (!viewIsIdle) {
@@ -479,14 +645,34 @@ async function preloadInactiveGeometries() {
 
   for (const geometryKey of Object.keys(geometries)) {
     if (geometryKey !== state.geometryKey) {
-      const entry = await ensureGeometryLayer(geometryKey).catch(() => null);
-
-      if (entry) {
-        await warmParquetFile(entry).catch(() => undefined);
-      }
+      await waitForPreloadIdleWindow();
+      await preloadResidentGeometry(geometryKey).catch(() => null);
     }
   }
 }
+
+async function waitForPreloadIdleWindow() {
+  while (performance.now() - lastUserInteractionAt < preloadIdleWindowMs) {
+    await delay(250);
+  }
+
+  await new Promise((resolve) => {
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(resolve, { timeout: 1500 });
+      return;
+    }
+
+    window.setTimeout(resolve, 250);
+  });
+}
+
+async function scheduleInactiveGeometryPreload() {
+  lastUserInteractionAt = performance.now();
+  await delay(preloadStartDelayMs);
+  await preloadInactiveGeometries();
+}
+
+state.syncGeometryLayers = syncCachedGeometryLayers;
 
 async function start() {
   setLoadingPageStatus("Preparing ArcGIS view...", "34%");
@@ -511,8 +697,11 @@ async function start() {
 
   await loadGeometry(state.geometryKey);
   controls.syncLayer();
+  for (const eventName of ["pointermove", "pointerdown", "wheel", "keydown"]) {
+    window.addEventListener(eventName, noteUserInteraction, { capture: true, passive: true });
+  }
   completeLoadingPage();
-  void preloadInactiveGeometries();
+  void scheduleInactiveGeometryPreload();
 }
 
 start().catch((error) => {

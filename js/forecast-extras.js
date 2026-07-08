@@ -971,7 +971,9 @@ function applyInfoMode(state) {
   const popupMode = state.infoMode === "popup";
 
   invalidatePopupRefresh(state);
-  if (state.layer) {
+  if (typeof state.syncGeometryLayers === "function") {
+    state.syncGeometryLayers({ style: false });
+  } else if (state.layer) {
     state.layer.popupEnabled = popupMode;
   }
 
@@ -1056,9 +1058,13 @@ function updateLayerStyle(state, fields, popupTemplateFor, createRenderer) {
   }
 
   const fieldName = state.selectedField;
-  state.layer.title = fields[fieldName].label;
-  state.layer.renderer = createRenderer(fieldName, state.geometry.geometryType, fields[fieldName].label);
-  state.layer.popupTemplate = popupTemplateFor(fieldName, state.geometry);
+  if (typeof state.syncGeometryLayers === "function") {
+    state.syncGeometryLayers({ style: true });
+  } else {
+    state.layer.title = fields[fieldName].label;
+    state.layer.renderer = createRenderer(fieldName, state.geometry.geometryType, fields[fieldName].label);
+    state.layer.popupTemplate = popupTemplateFor(fieldName, state.geometry);
+  }
   scheduleColorRampLegendOnly();
 }
 
@@ -1297,7 +1303,11 @@ function createTimeFilterController(state, timeSelect, timeSlider, validTimeWher
       const frameOptions = pendingOptions;
       pendingOptions = {};
       state.selectedEpoch = epoch;
-      state.layer.definitionExpression = validTimeWhere(epoch);
+      if (typeof state.syncGeometryLayers === "function") {
+        state.syncGeometryLayers({ style: false });
+      } else {
+        state.layer.definitionExpression = validTimeWhere(epoch);
+      }
       timeSelect.value = String(epoch);
 
       if (frameOptions.syncSlider !== false) {
