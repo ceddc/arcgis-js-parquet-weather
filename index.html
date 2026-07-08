@@ -1,12 +1,14 @@
 <!doctype html>
-<html lang="fr-CH">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="./assets/switzerland-weather-logo.png" type="image/png" />
-    <link rel="stylesheet" href="https://js.arcgis.com/5.1/@arcgis/core/assets/esri/themes/light/main.css" />
     <link rel="stylesheet" href="./css/style.css" />
     <script type="module" src="./js/loading-page.js"></script>
+    <script>
+      document.documentElement.lang = navigator.language || document.documentElement.lang || "en";
+    </script>
     <script type="module" src="https://js.arcgis.com/5.1/"></script>
     <script type="module" src="./js/app.js"></script>
     <title>ArcGIS ParquetLayer: MeteoSwiss Forecasts</title>

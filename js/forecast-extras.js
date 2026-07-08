@@ -45,8 +45,19 @@ const fieldKinds = {
 
 const hitAreaAttribute = "data-forecast-hit-area-installed";
 const hitAreaBufferPx = 18;
-const forecastLocale = "fr-CH";
 const forecastTimeZone = "Europe/Zurich";
+
+function userLocales() {
+  const languages = Array.isArray(navigator.languages) ? navigator.languages.filter(Boolean) : [];
+  return languages.length > 0 ? languages : [navigator.language || document.documentElement.lang || "en"];
+}
+
+function formatForecastDate(date, options) {
+  return new Intl.DateTimeFormat(userLocales(), {
+    ...options,
+    timeZone: forecastTimeZone,
+  }).format(date);
+}
 const surfaceColorAlpha = 0.78;
 const pointColorAlpha = 0.8;
 // MapView displays up to eight color visual-variable stops before simplifying the renderer.
@@ -179,16 +190,14 @@ mapElement.map = new Map({
   layers: [layer],
 });`;
 
-export function formatSwissForecastHour(epochSeconds) {
-  return new Intl.DateTimeFormat(forecastLocale, {
+export function formatForecastHour(epochSeconds) {
+  return formatForecastDate(new Date(epochSeconds * 1000), {
     day: "2-digit",
     hour: "2-digit",
-    hourCycle: "h23",
     minute: "2-digit",
     month: "2-digit",
-    timeZone: forecastTimeZone,
     year: "2-digit",
-  }).format(new Date(epochSeconds * 1000));
+  });
 }
 
 function hexToRgba(hex, alpha) {
@@ -719,10 +728,10 @@ function featureLocation(attributes, geometryType) {
 }
 
 function featureTimeLabel(attributes) {
-  return formatSwissFeatureTime(attributes, { year: false });
+  return formatForecastFeatureTime(attributes, { year: false });
 }
 
-export function formatSwissFeatureTime(attributes, options = {}) {
+export function formatForecastFeatureTime(attributes, options = {}) {
   const epochMs = numberAttribute(attributes, "valid_time_epoch_ms");
   let date = null;
 
@@ -737,15 +746,13 @@ export function formatSwissFeatureTime(attributes, options = {}) {
     return "";
   }
 
-  return new Intl.DateTimeFormat(forecastLocale, {
+  return formatForecastDate(date, {
     day: "2-digit",
     hour: "2-digit",
-    hourCycle: "h23",
     minute: "2-digit",
     month: "2-digit",
-    timeZone: forecastTimeZone,
     ...(options.year === false ? {} : { year: "2-digit" }),
-  }).format(date);
+  });
 }
 
 function clamp(value, minimum, maximum) {
@@ -971,7 +978,9 @@ function applyInfoMode(state) {
   const popupMode = state.infoMode === "popup";
 
   invalidatePopupRefresh(state);
-  if (state.layer) {
+  if (typeof state.syncGeometryLayers === "function") {
+    state.syncGeometryLayers({ style: false });
+  } else if (state.layer) {
     state.layer.popupEnabled = popupMode;
   }
 
@@ -1056,9 +1065,13 @@ function updateLayerStyle(state, fields, popupTemplateFor, createRenderer) {
   }
 
   const fieldName = state.selectedField;
-  state.layer.title = fields[fieldName].label;
-  state.layer.renderer = createRenderer(fieldName, state.geometry.geometryType, fields[fieldName].label);
-  state.layer.popupTemplate = popupTemplateFor(fieldName, state.geometry);
+  if (typeof state.syncGeometryLayers === "function") {
+    state.syncGeometryLayers({ style: true });
+  } else {
+    state.layer.title = fields[fieldName].label;
+    state.layer.renderer = createRenderer(fieldName, state.geometry.geometryType, fields[fieldName].label);
+    state.layer.popupTemplate = popupTemplateFor(fieldName, state.geometry);
+  }
   scheduleColorRampLegendOnly();
 }
 
@@ -1297,7 +1310,11 @@ function createTimeFilterController(state, timeSelect, timeSlider, validTimeWher
       const frameOptions = pendingOptions;
       pendingOptions = {};
       state.selectedEpoch = epoch;
-      state.layer.definitionExpression = validTimeWhere(epoch);
+      if (typeof state.syncGeometryLayers === "function") {
+        state.syncGeometryLayers({ style: false });
+      } else {
+        state.layer.definitionExpression = validTimeWhere(epoch);
+      }
       timeSelect.value = String(epoch);
 
       if (frameOptions.syncSlider !== false) {
