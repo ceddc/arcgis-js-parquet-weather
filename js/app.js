@@ -420,23 +420,19 @@ function deactivateInactiveGeometryLayers(activeLayer) {
 function syncCachedGeometryLayers(options = {}) {
   const updateStyle = options.style !== false;
   const expression = state.selectedEpoch ? validTimeWhere(state.selectedEpoch) : null;
+  const activeEntry = geometryLayerCache.get(state.geometryKey);
 
-  for (const cachedEntry of geometryLayerCache.values()) {
-    const { geometry, layer } = cachedEntry;
-
-    if (updateStyle) {
-      configureForecastLayer(layer, geometry);
-    } else if (expression) {
-      layer.definitionExpression = expression;
-    }
-
-    if (layer === state.layer) {
-      setLayerActive(cachedEntry, true);
-    } else if (mapHasLayer(layer)) {
-      setLayerDormant(cachedEntry);
-    }
+  if (!activeEntry || activeEntry.layer !== state.layer) {
+    return;
   }
 
+  if (updateStyle) {
+    configureForecastLayer(activeEntry.layer, activeEntry.geometry);
+  } else if (expression) {
+    activeEntry.layer.definitionExpression = expression;
+  }
+
+  setLayerActive(activeEntry, true);
   syncActiveLegendLayer(state.layer);
 }
 
@@ -651,6 +647,23 @@ async function preloadInactiveGeometries() {
   }
 }
 
+function shouldPreloadInactiveGeometries() {
+  const connection = navigator.connection ?? navigator.mozConnection ?? navigator.webkitConnection;
+  const effectiveType = String(connection?.effectiveType ?? "").toLowerCase();
+  const deviceMemory = Number(navigator.deviceMemory);
+  const compactViewport = window.matchMedia("(max-width: 700px)").matches;
+
+  if (connection?.saveData || ["slow-2g", "2g", "3g"].includes(effectiveType)) {
+    return false;
+  }
+
+  if (Number.isFinite(deviceMemory) && deviceMemory <= 2) {
+    return false;
+  }
+
+  return !compactViewport;
+}
+
 async function waitForPreloadIdleWindow() {
   while (performance.now() - lastUserInteractionAt < preloadIdleWindowMs) {
     await delay(250);
@@ -667,6 +680,10 @@ async function waitForPreloadIdleWindow() {
 }
 
 async function scheduleInactiveGeometryPreload() {
+  if (!shouldPreloadInactiveGeometries()) {
+    return;
+  }
+
   lastUserInteractionAt = performance.now();
   await delay(preloadStartDelayMs);
   await preloadInactiveGeometries();

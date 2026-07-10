@@ -1,3 +1,5 @@
+import { identityWhereForFeature } from "./feature-identity.js";
+
 // Advanced UI helpers for the demo.
 //
 // This file was produced with AI assistance after the core sample was kept small.
@@ -422,16 +424,18 @@ function applyColorRampLegendOnly() {
 function scheduleColorRampLegendOnly() {
   const runId = ++legendCleanupRun;
   let attempts = 0;
+  let successfulPasses = 0;
 
   const retry = () => {
     if (runId !== legendCleanupRun) {
       return;
     }
 
-    applyColorRampLegendOnly();
+    const foundColorRamp = applyColorRampLegendOnly();
     attempts += 1;
+    successfulPasses = foundColorRamp ? successfulPasses + 1 : 0;
 
-    if (attempts < 100) {
+    if (successfulPasses < 2 && attempts < 50) {
       window.setTimeout(retry, 100);
     }
   };
@@ -505,7 +509,7 @@ function totalFeatureCount(state) {
   return metadataNumber(state.sidecar?.feature_count);
 }
 
-function visibleFeatureCount(state) {
+function currentHourFeatureCount(state) {
   const perTimeStep = metadataNumber(state.sidecar?.features_per_time_step);
 
   if (perTimeStep !== null) {
@@ -534,11 +538,11 @@ function setupParquetStatsPanel(state) {
       return;
     }
 
-    const visible = visibleFeatureCount(state);
+    const currentHour = currentHourFeatureCount(state);
     const total = totalFeatureCount(state);
     const sizeText = formatMegabytes(state.parquetBytes);
     const countsText = [
-      `${formatCount(visible)} visible / ${formatCount(total)} total`,
+      `${formatCount(currentHour)} this hour / ${formatCount(total)} total`,
       sizeText,
     ].filter(Boolean).join(" · ");
 
@@ -1375,39 +1379,6 @@ function closestGraphicToMapPoint(features, mapPoint) {
     const featureDistance = Math.hypot(featurePoint.x - mapPoint.x, featurePoint.y - mapPoint.y);
     return featureDistance < closestDistance ? feature : closest;
   });
-}
-
-function sqlLiteral(value) {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return String(value);
-  }
-
-  return `'${String(value).replaceAll("'", "''")}'`;
-}
-
-function identityWhereForFeature(graphic, geometryType) {
-  const attributes = graphic?.attributes ?? {};
-  const candidates = geometryType === "point"
-    ? [["station_abbr"], ["postal_code"], ["name"]]
-    : [["hex_cell_id"], ["row", "column"], ["nearby_source_key"]];
-
-  for (const fieldNames of candidates) {
-    const parts = fieldNames.map((fieldName) => {
-      const value = attributes[fieldName];
-
-      if (value === null || value === undefined || value === "") {
-        return null;
-      }
-
-      return `${fieldName} = ${sqlLiteral(value)}`;
-    });
-
-    if (parts.every(Boolean)) {
-      return parts.join(" AND ");
-    }
-  }
-
-  return null;
 }
 
 function filteredWhere(layer, where) {

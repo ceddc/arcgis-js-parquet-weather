@@ -18,7 +18,7 @@ Open data snapshots
 -> ArcGIS Maps SDK for JavaScript loads the files with ParquetLayer
 ```
 
-The result is a static forecast explorer that can step through time and switch between raw points, square cells, and hexagons. The same approach can fit open data portals, forecast snapshots, generated model outputs, and read-only layers that are refreshed on a schedule.
+The result is a static forecast explorer that can step through time and switch between raw points, square cells, and hexagons. On capable desktop devices, inactive geometries preload after the first map becomes idle; constrained connections and compact devices load them on demand. The same approach can fit open data portals, forecast snapshots, generated model outputs, and read-only layers that are refreshed on a schedule.
 
 ## Start with these files
 

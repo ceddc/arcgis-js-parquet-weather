@@ -91,7 +91,12 @@ export function failLoadingPage(message = "Forecast layer failed to load") {
 
   ensureLoadingPage();
   state.screenElement?.classList.add("boot-screen--error");
-  completeLoadingPage(message);
+  state.screenElement?.setAttribute("role", "alert");
+  if (state.messageElement) {
+    state.messageElement.textContent = message;
+  }
+  state.progressElement?.style.setProperty("--boot-progress", "100%");
+  state.completed = true;
 }
 
 ensureLoadingPage();
